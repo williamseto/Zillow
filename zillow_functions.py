@@ -11,9 +11,22 @@ from selenium.webdriver.support import expected_conditions as EC
 from selenium.common.exceptions import TimeoutException
 from selenium.common.exceptions import NoSuchElementException
 
+from bs4 import BeautifulSoup
+from retrying import retry
+import json
+import requests
+
+import gc
+
 def zipcodes_list(st_items):
+
+    # (lat, lon, radius)
+    if type(st_items) == tuple:
+        zc_objects = zipcode.isinradius(st_items[:2], st_items[2])
+        output = [str(i).split(" ", 1)[1].split(">")[0]
+                    for i in zc_objects]
     # If st_items is a single zipcode string.
-    if type(st_items) == str:
+    elif type(st_items) == str:
         zc_objects = zipcode.islike(st_items)
         output = [str(i).split(" ", 1)[1].split(">")[0] 
                     for i in zc_objects]
@@ -28,10 +41,14 @@ def zipcodes_list(st_items):
 
 def init_driver(file_path):
     # Starting maximized fixes https://github.com/ChrisMuir/Zillow/issues/1
-    options = webdriver.ChromeOptions()
-    options.add_argument("--start-maximized")
+    # options = webdriver.ChromeOptions()
+    # options.add_argument("--start-maximized")
 
-    driver = webdriver.Chrome(executable_path=file_path, chrome_options=options)
+    # driver = webdriver.Chrome(executable_path=file_path, chrome_options=options)
+
+    driver = webdriver.Firefox()
+
+
     driver.wait = WebDriverWait(driver, 10)
     return(driver)
 
@@ -317,6 +334,117 @@ def get_url(soup_obj):
         else:
             url = "NA"
     return(url)
+
+# pulls html for a link and converts to soup object
+@retry(wait_random_min=1000, wait_random_max=2000)
+def get_soup(link):
+  
+    r = requests.get(link)
+
+    soup_obj = BeautifulSoup(r.text, 'lxml')
+
+    # check if CAPTCHA exists
+    if soup_obj.select('script[src="https://www.google.com/recaptcha/api.js"]'):
+        #print "got RECAPTCHA"
+        raise Exception('GOT RECAPTCHA')
+
+    # parcel_num = soup_obj.find('span', text='Parcel #: ').next_sibling.contents[0]
+    # print parcel_num
+
+    gc.collect()
+
+    return soup_obj
+
+def get_parcel(soup_obj):
+    try:
+        parcel_num = str(soup_obj.find('span', text='Parcel #: ').next_sibling.contents[0])
+    except:
+        print "couldnt get parcel num"
+        return "NA"
+
+    #print parcel_num
+    return parcel_num
+
+
+# gets tax rate area code for computing property tax
+# uses the parcel num and queries la-county
+def get_TRA(parcel_num):
+
+    #http://maps.assessor.lacounty.gov/Geocortex/Essentials/REST/sites/PAIS/SQLAINSearch?f=json&AIN=6325018002
+    
+    # now query LA county for TRA
+    c_query = "http://maps.assessor.lacounty.gov/Geocortex/Essentials/REST/sites/PAIS/SQLAINSearch?f=json&AIN="
+    c_query = c_query + parcel_num
+
+    t = requests.get(c_query)
+
+    try:
+        parcel_data = json.loads(t.text)[u'results']
+        tra = int(parcel_data[u'ParcelDetails'][u'TRA'])
+    except:
+        tra = "NA"
+    #print tra
+    return tra
+
+# gets both zestimate and rent estimate
+def get_zestimates(soup_obj):
+
+    zestimate = "NA"
+    restimate = "NA"
+    try:
+        zest_txt = soup_obj.find("input", { "id" : "HDPZestimateProxiedAssetsConfig" })['value']
+
+        # theres gotta be a better way.. (recursion??)
+        zest_json = json.loads(zest_txt)
+        zest_cfg_str = zest_json[u'config']
+        
+        skip_str = 'HDPZestimateProxiedReactAppGlobalConfig='
+        zest_cfg_json = json.loads(zest_cfg_str[len(skip_str):])
+
+        zest_mod_json = json.loads(zest_cfg_json[u'config'])[u'zestimateModule']
+
+        zestimate = zest_mod_json[u'zestimate']
+        restimate = zest_mod_json[u'restimate']
+
+    except:
+        print "couldnt find zestimate"
+
+    #print zestimate, restimate
+
+    return zestimate, restimate
+
+def get_rent_zestimate(soup_obj):
+    try:
+
+        zest_txt = soup_obj.find(
+                "span", {"data-target-id" : "rest-tip-hdp"}).find_next_sibling().get_text().strip()
+
+        zest_txt = zest_txt.replace(",", "").replace("$", "")
+
+        return zest_txt
+    except:
+        #print "couldnt find rent zestimate"
+        return "NA"
+
+def get_units(soup_obj):
+    try:
+        unit_count = str(soup_obj.find('span', text='Unit count: ').next_sibling.contents[0])
+        return unit_count
+    except:
+        print "couldnt get num units"
+        return "NA"
+
+def get_sqft2(soup_obj):
+    try:
+        floor_size = str(soup_obj.find('span', text='Floor size: ').next_sibling.contents[0])
+        # remove the ' sqft' text
+        sqft = floor_size[:-5].replace(",", "")
+
+        return sqft
+    except:
+        print "couldnt get sqft"
+        return "NA"
+
 
 def close_connection(driver):
     driver.quit()
